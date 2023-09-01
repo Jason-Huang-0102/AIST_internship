@@ -45,7 +45,7 @@ from sklearn.linear_model import LinearRegression
 # TODO: read SGD optimizer update process and seperate it into serveral parts to to weight update
 
 class _DistributedOptimizer(torch.optim.Optimizer):
-    def __init__(self, params, named_parameters, compression, seq_layernames=None, layerwise_times=None, norm_clip=None, threshold=0, writer=None, gradient_path=None, group_size=1):
+    def __init__(self, params, named_parameters, compression, seq_layernames=None, layerwise_times=None, norm_clip=None, threshold=0, writer=None, gradient_path=None, group_size=1, op="reducescatter_allgather"):
         super(self.__class__, self).__init__(params)
         self._compression = compression
         self._density = 1
@@ -59,6 +59,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._writer = writer
         self._gradient_path = gradient_path
         self.group_size = group_size
+        self.op = op
         # self.index = index
         self.index = hvd.rank()
         self.alpha = None
@@ -104,6 +105,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                                      for i, v in enumerate(param_group['params'])}
         # TODO : do we need to know how to merge the gradent in this work? or we only need to know how to implement the overlapping?
         self._generate_merged_parameters()
+        self.dist_wu()
 
         self._handles = {}
         self._grad_accs = []
@@ -149,11 +151,11 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 if p.requires_grad:
                     p.grad = p.data.new(p.size()).zero_()
                     self._requires_update.add(p)
-                    p_tmp = p.expand_as(p)
-                    grad_acc = p_tmp.grad_fn.next_functions[0][0]
+                    # p_tmp = p.expand_as(p)
+                    # grad_acc = p_tmp.grad_fn.next_functions[0][0]
                     # hook function on gradient to call reduce scatter (self._make_hook)
-                    grad_acc.register_hook(self._make_hook(p))
-                    self._grad_accs.append(grad_acc)
+                    p.register_hook(self._make_hook(p))
+                    # self._grad_accs.append(grad_acc)
 
     # def _main_rank(self):
     #     a = torch.Tensor([1] * 15)
@@ -314,6 +316,22 @@ class _DistributedOptimizer(torch.optim.Optimizer):
 
         return groups, key_groupidx_maps
 
+ 
+
+    def dist_wu(self):
+        hs = hvd.size()
+        index = hvd.rank()
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    s = p.size().numel()//hs
+                    q = p.size().numel()%hs
+                    if index < q:
+                        p = p.view(-1)[index*s+index: (index+1)*s+index+1]
+                    elif index == q:
+                        p = p.view(-1)[index*s+index: (index+1)*s+index]
+                    else:
+                        p = p.view(-1)[index*s+q: (index+1)*s+q]
 
     def _generate_merged_parameters(self):
         self._merged_parameters = {}
@@ -337,11 +355,12 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 offsets.append(sub_size)
                 numel = self._named_parameters[k].data.numel()
                 sub_size += numel
-            # print("subset size in each group : {}".format(sub_size))
-
             new_key = ':'.join(g)
             new_keys.append(new_key)
-            t = torch.zeros(sub_size, device=self._named_parameters[g[0]].device, dtype=self._named_parameters[g[0]].dtype, requires_grad=True)
+            if self.op == "allreduce":
+                t = torch.zeros(sub_size, device=self._named_parameters[g[0]].device, dtype=self._named_parameters[g[0]].dtype, requires_grad=False)
+            else:
+                t = torch.zeros(sub_size, device=self._named_parameters[g[0]].device, dtype=self._named_parameters[g[0]].dtype, requires_grad=True)
             self._merged_parameters[new_key] = t
             self._merged_parameter_names[t] = new_key
             self._merged_parameter_offsets[new_key] = offsets
@@ -374,14 +393,12 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                     # print(self._groups_flags[group_idx])
                     return name, None
                 # print("no index equal to zero")
-                self._groups_flags[group_idx]
             return new_key, self._merged_parameters[new_key]
 
     def _pull_from_buffer(self, name, merged_tensor):
         if len(self._groups) == len(self._sequential_keys):
             shape = self._named_parameters[name].data.shape
             return {name: merged_tensor.view(shape)}
-        # print("_pull_from_buffer : {}".format(name))
         offsets = self._merged_parameter_offsets[name]
         g = name.split(':')
         group_idx = self._key_groupidx_maps[g[0]]
@@ -441,9 +458,12 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 # add
                 new_name, new_tensor = self._push_to_buffer(name, p.grad.data)
                 if new_tensor is not None:
-                    new_tensor_view = new_tensor.view(-1)
-                    # print("new_tensor size() : {}".format(new_tensor.size()))
-                    handle = reducescatter_async(new_tensor_view)
+                    if self.op == "allreduce":
+                        handle, ctx = self._allreduce_grad_async(new_tensor, new_name)
+                    else:
+                        # new_tensor_view = new_tensor.view(-1)
+                        # print("new_tensor size() : {}".format(new_tensor.size()))
+                        handle = reducescatter_async(new_tensor.view(-1), new_name)
                     self._handles[new_tensor] = (handle, 1)
                 # run for all asynchronize reduce_scatter
                 # tensor = p.grad.view(-1)
@@ -476,28 +496,31 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             #         output.mul_(clip_coef)
 
             btime = time.time()
-            s = p.size().numel()//hvd.size()
-            q = p.size().numel()%hvd.size()
-            
-            # print("p.size() : {}".format(p.size()))
-            # print("output size() : {}".format(output.size()))
-            # print(" self.index*s + self.index : (self.index+1)*s + self.index size: {}".format( p.grad.view(-1)[ self.index*s + self.index : (self.index+1)*s + self.index].size()))
-            if self.index < q:
-                p.data.view(-1)[ self.index*s + self.index : (self.index+1)*s + self.index + 1]=output
-            elif self.index == q:
-                p.data.view(-1)[ self.index*s + self.index : (self.index+1)*s + self.index]=output
+            if self.op == "allreduce":
+                p.set_(output)
             else:
-                p.data.view(-1)[ self.index*s + q : (self.index+1)*s + q]=output
+                s = p.size().numel()//hvd.size()
+                q = p.size().numel()%hvd.size()
+                
+                # print("p.size() : {}".format(p.size()))
+                # print("output size() : {}".format(output.size()))
+                # print(" self.index*s + self.index : (self.index+1)*s + self.index size: {}".format( p.grad.view(-1)[ self.index*s + self.index : (self.index+1)*s + self.index].size()))
+                if self.index < q:
+                    p.data.view(-1)[ self.index*s + self.index : (self.index+1)*s + self.index + 1]=output
+                elif self.index == q:
+                    p.data.view(-1)[ self.index*s + self.index : (self.index+1)*s + self.index]=output
+                else:
+                    p.data.view(-1)[ self.index*s + q : (self.index+1)*s + q]=output
             
             etime = time.time()
 
 
-            # if self._profiling:
-            #     utils.force_insert_item(self._update_times, name, time.time()-stime)
+    
+
+        # maybe we don't need to set the grad 
+
         if len(self._groups) != len(self._sequential_keys):
-            # print(self._merged_parameter_names.keys())
             for merged_p, value in self._handles.items():
-                # print("merged_p : {}".format(merged_p))
                 new_name = self._merged_parameter_names.get(merged_p)
                 tensors = self._pull_from_buffer(new_name, merged_p)
                 for n in tensors:
@@ -506,9 +529,9 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                         p.grad.set_(tensors[n].data.type(p.grad.type()))
                     else:
                         p.grad.set_(tensors[n].data)
+
         self.train_iter += 1
         self._handles.clear()
-        # self._print_profiling()
 
 
     def _print_profiling(self):
@@ -544,8 +567,14 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         return super(self.__class__, self).step(closure)
         # return super(self.__class__, self).step(index, closure)
 
+    def zero_grad(self):
+        if self._handles:
+            raise AssertionError("optimizer.zero_grad() was called after loss.backward() "
+                                    "but before optimizer.step() or optimizer.synchronize(). "
+                                    "This is prohibited as it can cause a race condition.")
+        return super(self.__class__, self).zero_grad()
 
-def DistributedOptimizer(optimizer, named_parameters=None, compression=None, density=0.001, seq_layernames=None, layerwise_times=None, norm_clip=None, threshold=0, writer=None, gradient_path=None, group_size = 1):
+def DistributedOptimizer(optimizer, named_parameters=None, compression=None, density=0.001, seq_layernames=None, layerwise_times=None, norm_clip=None, threshold=0, writer=None, gradient_path=None, group_size=1, op="reducescatter_allgather"):
     """
     An optimizer that wraps another torch.optim.Optimizer, using an allreduce to
     average gradient values before applying gradients to model weights.
@@ -581,7 +610,7 @@ def DistributedOptimizer(optimizer, named_parameters=None, compression=None, den
     cls = type(optimizer.__class__.__name__, (optimizer.__class__,),
                dict(_DistributedOptimizer.__dict__))
 
-    return cls(optimizer.param_groups, named_parameters, compression, seq_layernames=seq_layernames, layerwise_times=layerwise_times, norm_clip=None, threshold=threshold, writer=writer, gradient_path=gradient_path, group_size=group_size)
+    return cls(optimizer.param_groups, named_parameters, compression, seq_layernames=seq_layernames, layerwise_times=layerwise_times, norm_clip=None, threshold=threshold, writer=writer, gradient_path=gradient_path, group_size=group_size, op=op)
 
 
 def broadcast_parameters(params, root_rank):
@@ -614,7 +643,6 @@ def broadcast_parameters(params, root_rank):
     # Wait for completion.
     for handle in handles:
         synchronize(handle)
-
 
 def broadcast_optimizer_state(optimizer, root_rank):
     """

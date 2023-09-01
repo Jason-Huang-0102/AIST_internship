@@ -28,6 +28,7 @@ from horovod.torch.mpi_ops import reducescatter_async
 from horovod.torch.mpi_ops import synchronize
 # from torchsummary import summary
 from torch.optim.lr_scheduler import LambdaLR
+from distributed_sgd import SGD
 # handles = {}
 
 
@@ -120,7 +121,7 @@ def train(epoch, log_dir):
             # optimizer.synchronize()
             torch.cuda.synchronize()
             start = time.time()
-            # adjust_learning_rate(epoch, batch_idx)
+            adjust_learning_rate(epoch, batch_idx)
             if args.cuda:
                 data, target = data.cuda(), target.cuda()
             optimizer.zero_grad()
@@ -264,9 +265,24 @@ def validate(epoch, log_dir):
 # accuracy. Scale the learning rate `lr = base_lr` ---> `lr = base_lr * hvd.size()` during
 # the first five epochs. See https://arxiv.org/abs/1706.02677 for details.
 #  On CIFAR learning rate dropped by 0.2 at 60, 120 and 160 epochsand we train for total 200 epoch
-def adjust_learning_rate(epoch):
+# def adjust_learning_rate(epoch):
     
-    if epoch < 60:
+#     if epoch < 60:
+#         lr_adj = 1.
+#     elif epoch < 120:
+#         lr_adj = 0.2
+#     elif epoch < 160:
+#         lr_adj = 0.04
+#     else:
+#         lr_adj = 0.008
+#     return lr_adj
+
+
+def adjust_learning_rate(epoch, batch_idx):
+    if epoch < args.warmup_epochs:
+        epoch += float(batch_idx + 1) / len(train_loader)
+        lr_adj = 1. / hvd.size() * (epoch * (hvd.size() - 1) / args.warmup_epochs + 1)
+    elif epoch < 60:
         lr_adj = 1.
     elif epoch < 120:
         lr_adj = 0.2
@@ -274,7 +290,9 @@ def adjust_learning_rate(epoch):
         lr_adj = 0.04
     else:
         lr_adj = 0.008
-    return lr_adj
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = args.base_lr * hvd.size() * args.batches_per_allreduce * lr_adj
+
 def accuracy(output, target):
     # get the index of the max log-probability
     pred = output.max(1, keepdim=True)[1]
@@ -467,11 +485,11 @@ class Merge_GE_FORWARD():
 
 
         if index < q:
-            handle = allgather_async(tensor[ index*s + index : (index+1)*s + index + 1])
+            handle = allgather_async(tensor[ index*s + index : (index+1)*s + index + 1], allgather_name)
         elif index == q:
-            handle = allgather_async(tensor[ index*s + index : (index+1)*s + index])
+            handle = allgather_async(tensor[ index*s + index : (index+1)*s + index], allgather_name)
         else:
-            handle = allgather_async(tensor[index*s + q : (index+1)*s + q])
+            handle = allgather_async(tensor[index*s + q : (index+1)*s + q], allgather_name)
         return handle, None
 
     def _weight_exchange(self):
@@ -551,7 +569,7 @@ class Merge_GE_FORWARD():
                 # print("synchronize\n")
                 output = synchronize(handle)
                 # print(output.size())
-                p.set_(output.data)
+                p.set_(output)
                 # if self._profiling:
                 #     utils.force_insert_item(self._update_times, name, time.time()-stime)
             if len(self._groups) != len(self._sequential_keys):
@@ -566,7 +584,7 @@ class Merge_GE_FORWARD():
                         # else:
                             # p.grad.set_(tensors[n].data)
                         # with torch.no_grad():
-                        p.data.copy_(tensors[n])
+                        p.data.copy_(tensors[n].data)
                     # torch.cuda.empty_cache()
             # print("len(self._handles) : {}".format(len(self._handles)))
             self._handles.clear()
@@ -587,6 +605,22 @@ class Merge_GE_FORWARD():
     #     output = synchronize(handle)
     #     index = int(output.detach().cpu().tolist()[0]//2)
     #     return index
+
+# def dist_wu(optimizer):
+#     hs = hvd.size()
+#     index = hvd.rank()
+#     for group in optimizer.param_groups:
+#         for p in group['params']:
+#             if p.grad is not None:
+#                 s = p.size().numel()//hs
+#                 q = p.size().numel()%hs
+#                 if index < q:
+#                     p = p.view(-1)[index*s+index: (index+1)*s+index+1]
+#                 elif index == q:
+#                     p = p.view(-1)[index*s+index: (index+1)*s+index]
+#                 else:
+#                     p = p.view(-1)[index*s+q: (index+1)*s+q]
+
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -719,6 +753,8 @@ if __name__ == '__main__':
         model = torchvision.models.vgg16()
     if args.model=='efficientnet':
         model = torchvision.models.efficientnet_v2_l()
+    if args.model=='vgg19':
+        model = torchvision.models.vgg19()
     # if hvd.rank()==0:
     #     print(summary(model.cuda(), input_size=(3, 224, 224)))
 
@@ -735,11 +771,31 @@ if __name__ == '__main__':
             lr_scaler = args.batches_per_allreduce * hvd.local_size()
 
     # Horovod: scale learning rate by the number of GPUs.
+
+    # index = hvd.rank()
+    # dis_params = []
+    # for param in list(model.parameters()):
+    #     if param.requires_grad:
+    #         p = param.view(-1)
+    #         s = p.size().numel()//hvd.size()
+    #         q = p.size().numel()%hvd.size()
+    #         if index < q:
+    #             dis_params.append(p[ index*s + index : (index+1)*s + index + 1])
+    #         elif index == q:
+    #             dis_params.append(p[ index*s + index : (index+1)*s + index])
+    #         else:
+    #             dis_params.append(p[index*s + q : (index+1)*s + q])
+
+
+    # optimizer = optim.SGD(dis_params,
+    #                       lr=(args.base_lr *
+    #                           lr_scaler),
+    #                       momentum=args.momentum, weight_decay=args.wd)
     optimizer = optim.SGD(model.parameters(),
                           lr=(args.base_lr *
                               lr_scaler),
                           momentum=args.momentum, weight_decay=args.wd)
-    
+    # dist_wu(optimizer)
     # Horovod: (optional) compression algorithm.
     compression = hvd.Compression.fp16 if args.fp16_allreduce else hvd.Compression.none
 
@@ -754,11 +810,12 @@ if __name__ == '__main__':
         compression=compression,
         seq_layernames=seq_layernames,
         group_size = args.group_size,
+        op = "reducescatter_allgather",
         # index = index,
         # op=hvd.Adasum if args.use_adasum else hvd.Average,
         # gradient_predivide_factor=args.gradient_predivide_factor
         )
-    scheduler = LambdaLR(optimizer, lr_lambda=adjust_learning_rate)
+    # scheduler = LambdaLR(optimizer, lr_lambda=adjust_learning_rate)
     # Restore from a previous checkpoint, if initial_epoch is specified.
     # Horovod: restore on the first worker which will broadcast weights to other workers.
     if resume_from_epoch > 0 and hvd.rank() == 0:
@@ -784,7 +841,7 @@ if __name__ == '__main__':
         train(epoch,args.log_dir)
         # print('---------------------train end---------------------------')
         validate(epoch, args.log_dir)
-        scheduler.step()
+        # scheduler.step()
         #save_checkpoint(epoch)
         # if epoch % 10 == 0:
            # save_checkpoint(epoch)
