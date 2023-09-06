@@ -31,16 +31,11 @@ import torch
 import numpy as np
 import os
 
-# import utils
 
 import collections
 import settings
-# from settings import logger, ADAPTIVE_MERGE, DEBUG
 
-# from profiling import CommunicationProfiler
 from sklearn.linear_model import LinearRegression
-# TODO : step3 weight sharding update
-# from distributed_sgd import sharding_step
 
 # TODO: read SGD optimizer update process and seperate it into serveral parts to to weight update
 
@@ -103,9 +98,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             self._parameter_names = {v: 'allreduce.noname.%s' % i
                                      for param_group in self.param_groups
                                      for i, v in enumerate(param_group['params'])}
-        # TODO : do we need to know how to merge the gradent in this work? or we only need to know how to implement the overlapping?
         self._generate_merged_parameters()
-        self.dist_wu()
 
         self._handles = {}
         self._grad_accs = []
@@ -114,57 +107,19 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._hook_checked_idx = 0
         if size() > 1:
             self._register_hooks()
-            # self._main_rank()
+ 
 
-        # self.time_file = open(os.path.join("/workspace/internship/logfile26/", "cp_time.log"), "a", buffering=1)    
 
-    def _benchmark_communication(self):
-        logger.info('Benchmarking communication performance...')
-        comm_profiler = CommunicationProfiler(allreduce_async_, synchronize)
-        sizes, times = comm_profiler.benchmark(num_iters=10)
-        def _fit_linear_function(x, y):
-            X = np.array(x).reshape((-1, 1)) * 4
-            Y = np.array(y)
-            model = LinearRegression()
-            model.fit(X, Y)
-            alpha = model.intercept_
-            beta = model.coef_[0]
-            return alpha, beta
-        alpha, beta = _fit_linear_function(sizes, times)
-        self.alpha = alpha
-        self.beta = beta
-        alpha_tensor = torch.ones(1) * alpha 
-        beta_tensor = torch.ones(1) * beta 
-        alpha_tensor = broadcast(alpha_tensor, root_rank=0)
-        beta_tensor = broadcast(beta_tensor, root_rank=0)
-        if rank() != 0:
-            self.alpha = float(alpha_tensor[0])
-            self.beta = float(beta_tensor[0])
-        logger.info('[rank:{}] Communication performance fitted with f(p)=a+b*p, where a={} and b={}'.format(rank(), self.alpha, self.beta))
-
-    
+    # we hook a specific function on each parameter. The specific function will be called every time after backward() is done.
     def _register_hooks(self):
-        # print(self.param_groups)a
-        # p is the parameter in model
         for param_group in self.param_groups:
             for p in param_group['params']:
                 if p.requires_grad:
                     p.grad = p.data.new(p.size()).zero_()
                     self._requires_update.add(p)
-                    # p_tmp = p.expand_as(p)
-                    # grad_acc = p_tmp.grad_fn.next_functions[0][0]
-                    # hook function on gradient to call reduce scatter (self._make_hook)
                     p.register_hook(self._make_hook(p))
-                    # self._grad_accs.append(grad_acc)
 
-    # def _main_rank(self):
-    #     a = torch.Tensor([1] * 15)
-    #     handle = reducescatter_async(a)
-    #     output = synchronize(handle)
-    #     if output.size() == 1:
-    #         self.main_gpu = (hvd.rank() + 1) % self.gpus
-
-
+    # record the group member in each group
     def _generate_groups_with_number(self):
         sizes = [self._named_parameters[k].data.numel() for k in self._sequential_keys][::-1] # reverse order
         self._sizes = sizes
@@ -174,11 +129,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         key_groupidx_maps = {}
         idx = 0
         for k in self._sequential_keys[::-1]:
-            # numel = self._named_parameters[k].data.numel()
-            # sub_size += numel
             num += 1
             key_groupidx_maps[k] = idx
-            # if sub_size < threshold:
             if num < self.group_size:
                 group.append(k)
             else:
@@ -192,155 +144,12 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         return groups, key_groupidx_maps
 
 
-    def _generate_groups_with_threshold(self, threshold):
-        sizes = [self._named_parameters[k].data.numel() for k in self._sequential_keys][::-1] # reverse order
-        self._sizes = sizes
-        sub_size = 0
-        groups = []
-        group = []
-        key_groupidx_maps = {}
-        idx = 0
-        for k in self._sequential_keys[::-1]:
-            numel = self._named_parameters[k].data.numel()
-            sub_size += numel
-            key_groupidx_maps[k] = idx
-            if sub_size < threshold:
-                group.append(k)
-            else:
-                idx += 1
-                group.append(k)
-                groups.append(group)
-                group = []
-                sub_size = 0
-        if len(group) > 0:
-            groups.append(group)
-        return groups, key_groupidx_maps
-
-    def _generate_groups_mgwfbp(self):
-        num_of_workers = size()
-        p_alpha_beta_56Gbps = {
-                16: (0.00023583677659915685, 4.0594787739537565e-10),
-                8: (9.75367204301171e-05, 3.0568230536676206e-10),
-                4: (4.204298980348825e-05, 2.0589360830118177e-10),
-                2: (2.554691138304671e-06, 9.837548167872609e-11)
-                }
-        p_alpha_beta_10Gbps = {
-                16: (0.0009080981007148093, 7.395651186836712e-10),
-                8: (0.0005230272768511732, 8.570746975492128e-10),
-                4: (4.204298980348825e-05, 2.0589360830118177e-10),
-                2: (2.554691138304671e-06, 9.837548167872609e-11)
-                }
-        if self.alpha is not None:
-            alpha, beta = self.alpha, self.beta
-        else:
-            if settings.CONNECTION == '10GbE':
-                alpha, beta = p_alpha_beta_10Gbps[num_of_workers]
-            else:
-                alpha, beta = p_alpha_beta_56Gbps[num_of_workers]
-        nbytes = 2 if settings.FP16 else 4
-
-        def __calculate_comm_start(tc, tb, taob, L):
-            taoc = [0] * L 
-            taoc[L-1] = taob[L-1] + tb[L-1]
-            for l in range(L-1)[::-1]:
-                taoc[l] = max(taoc[l+1] + tc[l+1], taob[l] + tb[l])
-            return taoc
-
-        # for merge gradient communication time
-        def __merge(taob, tc, p, l):
-            tc[l] = 0
-            p[l-1] = p[l-1]+p[l]
-            p[l] = 0
-            if self.size_commtime_dict is not None:
-                tc[l-1] = self.size_commtime_dict[l-1]
-            else:
-                tc[l-1] = utils.predict_allreduce_time_with_size(alpha, beta, p[l-1]*nbytes, num_of_workers)
-        sizes = [self._named_parameters[k].data.numel() for k in self._seq_layernames]
-        seq_layernames = self._seq_layernames
-        if not utils.check_unique(seq_layernames):
-            raise ValueError
-        self._sizes = sizes
-        p = sizes[:]
-        L = len(sizes)
-        if self.size_commtime_dict is not None:
-            tc = [self.size_commtime_dict[s] for s in sizes]
-        else:
-            tc = [utils.predict_allreduce_time_with_size(alpha, beta, s*nbytes, num_of_workers) for s in sizes]
-        tb = list(self._layerwise_times)
-        taob = [0]*L
-        for l in range(0,L-1)[::-1]:
-            taob[l] = taob[l+1] + tb[l+1]
-        taoc = __calculate_comm_start(tc, tb, taob, L)
-        if rank() == 0:
-            logger.info('tc sum: %f', np.sum(tc))
-        groups = []
-        group = []
-        idx = 0
-        key_groupidx_maps = {}
-        l = L-1
-        key = seq_layernames[l] 
-        key_groupidx_maps[key] = idx
-        for l in range(1, L)[::-1]:
-            key = seq_layernames[l]
-            group.append(key)
-            key_groupidx_maps[key] = idx
-            current_taob = taob[l-1] + tb[l-1]
-            merged=False
-            if current_taob < taoc[l]+tc[l]:
-                if taoc[l] > current_taob:
-                    __merge(taob, tc, p, l)
-                    taoc = __calculate_comm_start(tc, tb, taob, L)
-                    merged=True
-                else:
-                    t_wait = current_taob - taoc[l]
-                    t_saved = alpha
-                    if t_wait < t_saved:
-                        __merge(taob, tc, p, l)
-                        taoc = __calculate_comm_start(tc, tb, taob, L)
-                        merged=True
-            if not merged:
-                idx += 1
-                groups.append(group)
-                group = []
-        l = 0
-        key = seq_layernames[l]
-        key_groupidx_maps[key] = idx
-        group.append(key)
-        if len(group) > 0:
-            groups.append(group)
-
-        if rank() == 0:
-            logger.info('Predicted non-overlapped time: %f', taoc[0]+tc[0]-(taob[0]+tb[0]))
-            logger.info('Predicted tb+tc= %f', taoc[0]+tc[0])
-            logger.info('Merged tc sum: %f', np.sum(tc))
-
-        return groups, key_groupidx_maps
-
- 
-
-    def dist_wu(self):
-        hs = hvd.size()
-        index = hvd.rank()
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is not None:
-                    s = p.size().numel()//hs
-                    q = p.size().numel()%hs
-                    if index < q:
-                        p = p.view(-1)[index*s+index: (index+1)*s+index+1]
-                    elif index == q:
-                        p = p.view(-1)[index*s+index: (index+1)*s+index]
-                    else:
-                        p = p.view(-1)[index*s+q: (index+1)*s+q]
-
+    # merge several (self.group_size) parameters into a group 
     def _generate_merged_parameters(self):
         self._merged_parameters = {}
         self._merged_parameter_names = {}
 
-        if settings.ADAPTIVE_MERGE and self._layerwise_times is not None:
-            groups, key_groupidx_maps = self._generate_groups_mgwfbp()
-        else:
-            groups, key_groupidx_maps = self._generate_groups_with_number()
+        groups, key_groupidx_maps = self._generate_groups_with_number()
         # logger.info('# of parameters: %d', np.sum(self._sizes))
         # logger.info('Total number of tensors: %s', len(self._sizes))
         # logger.info('Merged Number of groups: %s', len(groups))
@@ -348,6 +157,8 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._merged_parameter_offsets = {}
         self._layerwise_compressors = None
         self._layerwise_compressors = {}
+        
+        # create the merge_parameter tensor (t) to store the content of  model parameter
         for g in groups:
             sub_size = 0
             offsets = []
@@ -373,7 +184,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
                 flags.append(0)
             self._groups_flags.append(flags)
 
-
+    # assign the value of model parameter into merge_parameter tensor 
     def _push_to_buffer(self, name, tensor):
         with torch.no_grad():
             if len(self._groups) == len(self._sequential_keys):
@@ -387,14 +198,14 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             numel = tensor.data.numel()
             self._merged_parameters[new_key].data[offset:offset+numel].copy_(tensor.view(numel))
             self._groups_flags[group_idx][layer_idx] = 1
+            # record if all para in groups is done or not.
             for idx in self._groups_flags[group_idx]:
+                # if there is someone have not been assigned into merge tensor, the tensor will return None
                 if idx == 0:
-                    # print("there is/are index equal to zero")
-                    # print(self._groups_flags[group_idx])
                     return name, None
-                # print("no index equal to zero")
             return new_key, self._merged_parameters[new_key]
 
+    # get the value of model parameter from merge_parameter tensor 
     def _pull_from_buffer(self, name, merged_tensor):
         if len(self._groups) == len(self._sequential_keys):
             shape = self._named_parameters[name].data.shape
@@ -411,6 +222,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             tensors[k] = merged_tensor.data[offset:offset+numel].view(original_tensor.shape)
         return tensors
 
+    # baseline : do Reduce_Scatter + Allgather
     def _allreduce_grad_async(self, p, name):
         tensor = p.data.view(-1)
         allreduce_name = name
@@ -421,90 +233,42 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         handle = allreduce_async_(tensor, average=True, name=allreduce_name)
         return handle, None
 
-    def check_hooked_tensor_sequence(self, name):
-        if self._seq_layernames is None:
-            return
-        ntensors = len(self._seq_layernames)
-        idx = self._seq_layernames.index(name)
-        if idx == ntensors-self._hook_checked_idx-1:
-            self._hook_checked_idx += 1
-            if idx == 0:
-                self._hook_checked_idx = 0
-        else:
-            # logger.info('Hook checked error, name: %s should be in the index of %d, which it runs at %d',
-            #         name, self._hook_checked_idx, idx)
-            raise
 
-#  TODO: how to change the gradient in this approach
-
+    # if the backward is done, the _make_hook function will be called 
     def _make_hook(self, p):
-        # def hook(*ignore):
-        #     assert p not in self._handles
-        #     assert not p.grad.requires_grad
-        #     if not self.local:
-        #         name = self._parameter_names.get(p)
-        #         self.check_hooked_tensor_sequence(name)
-        #         new_name, new_tensor = self._push_to_buffer(name, p.grad.data)
-        #         if new_tensor is not None:
-        #             # run for all asynchronize allreduce
-        #             handle, ctx = self._allreduce_grad_async(new_tensor, new_name)
-        #             self._handles[new_tensor] = (handle, ctx, 1)
         def hook(*ignore):
             assert p not in self._handles
             assert not p.grad.requires_grad
             if not self.local:
                 name = self._parameter_names.get(p)
-                # self.check_hooked_tensor_sequence(name)
-                # add
+                # if the merge_parameter is ready, the new_tensor is not None and do the following operation
                 new_name, new_tensor = self._push_to_buffer(name, p.grad.data)
                 if new_tensor is not None:
                     if self.op == "allreduce":
                         handle, ctx = self._allreduce_grad_async(new_tensor, new_name)
                     else:
-                        # new_tensor_view = new_tensor.view(-1)
-                        # print("new_tensor size() : {}".format(new_tensor.size()))
+                        
                         handle = reducescatter_async(new_tensor.view(-1), new_name)
                     self._handles[new_tensor] = (handle, 1)
-                # run for all asynchronize reduce_scatter
-                # tensor = p.grad.view(-1)
-                # handle = reducescatter_async(tensor, name=name)
-                # self._handles[p] = (handle, 1)
         return hook
 
+    # synchronize the handles and put the result back to model parameters 
     def synchronize(self):
 
-        # Sync: For loop to check comm handles at optimizer.step()
-        # print("---------------------------------------------reduce_scatter divided start-----------------------------------------------------------")
         for p, value in self._handles.items():
-            # name = self._merged_parameter_names.get(p)
-            # handle, ctx, density = value
             handle, density = value
             stime = time.time()
             # synchronize the handler
             output = synchronize(handle)
-            # if self._profiling:
-            #     utils.force_insert_item(self._allreduce_timers, name, time.time()-stime)
-            # stime = time.time()
-
-            # if self._norm_clip is not None:
-            #     norm_clip = np.sqrt(1.0/size()) * self._norm_clip
-            #     norm_type = 2.0
-            #     param_norm = output.norm(norm_type)
-            #     total_norm = param_norm.item() 
-            #     clip_coef = norm_clip / (total_norm + 1e-6)
-            #     if clip_coef < 1:
-            #         output.mul_(clip_coef)
-
+           
             btime = time.time()
+            # put the computed result back to the merge_parameters
             if self.op == "allreduce":
                 p.set_(output)
             else:
                 s = p.size().numel()//hvd.size()
                 q = p.size().numel()%hvd.size()
                 
-                # print("p.size() : {}".format(p.size()))
-                # print("output size() : {}".format(output.size()))
-                # print(" self.index*s + self.index : (self.index+1)*s + self.index size: {}".format( p.grad.view(-1)[ self.index*s + self.index : (self.index+1)*s + self.index].size()))
                 if self.index < q:
                     p.data.view(-1)[ self.index*s + self.index : (self.index+1)*s + self.index + 1]=output
                 elif self.index == q:
@@ -514,11 +278,7 @@ class _DistributedOptimizer(torch.optim.Optimizer):
             
             etime = time.time()
 
-
-    
-
-        # maybe we don't need to set the grad 
-
+        # split the merge_parameters into serveral tensor and put it back to the model parameters
         if len(self._groups) != len(self._sequential_keys):
             for merged_p, value in self._handles.items():
                 new_name = self._merged_parameter_names.get(merged_p)
@@ -534,38 +294,11 @@ class _DistributedOptimizer(torch.optim.Optimizer):
         self._handles.clear()
 
 
-    def _print_profiling(self):
-        if self._profiling and rank() == 0 and len(self._allreduce_timers.keys()) > 0 and len(self._allreduce_timers.get(self._allreduce_timers.keys()[0], [])) ==  40:
-            cps = self._compression_timers # compression
-            ars = self._allreduce_timers # allreduce times
-            ups = self._update_times # update times
-            r = rank()
-            tcp = 0.0; tar = 0.0; tup = 0.0; total=0.0
-            for k in cps:
-                acp = np.mean(cps[k])
-                tcp += acp
-                aar = np.mean(ars[k])
-                tar += aar
-                aup = np.mean(ups[k])
-                tup += aup
-            total = tcp+tar+tup
-            logger.info('[%d]: Total compress: %f, allreduce: %f, update: %f, total: %f', r, tcp, tar, tup, total)
-            cps.clear()
-            ars.clear()
-            ups.clear()
-
-
     def step(self, index=None, closure=None):
-        # print("--------------synchronize() start----------------------")
+
         if not self.local:
             self.synchronize()
-        # print("--------------synchronize() end----------------------")
-        # print("Distributed_optimizer step()")
-        # call torch optimizer .step()
-        # return super(self.__class__, self).step(closure)
-        # TODO: how to know which gradients needs to be updated
         return super(self.__class__, self).step(closure)
-        # return super(self.__class__, self).step(index, closure)
 
     def zero_grad(self):
         if self._handles:

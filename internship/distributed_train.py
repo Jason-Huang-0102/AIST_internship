@@ -131,12 +131,10 @@ def train(epoch, log_dir):
             # Split data into sub-batches of size batch_size
             for i in range(0, len(data), args.batch_size):
                 # torch.cuda.synchronize()
-                # print(1)
                 start = time.time()
                 data_batch = data[i:i + args.batch_size]
                 target_batch = target[i:i + args.batch_size]
                 # forward
-                # print(i)
                 output = model(data_batch)
                 loss = F.cross_entropy(output, target_batch)
                 # torch.cuda.synchronize()
@@ -148,16 +146,10 @@ def train(epoch, log_dir):
                 accuracy_iter = accuracy(output, target_batch)
                 train_accuracy.update(accuracy_iter)
                 train_loss.update(loss)
-                # if rank == 0 and (batch_idx % number_iter_track == 0):
-                    # print("{:.10f}".format(train_accuracy.avg), file=accuracy_iter_file) 
-                    # print("{:.10f}".format(train_loss.avg), file=loss_iter_file) 
-                # else:
-                    # None
+
                 torch.cuda.synchronize()
-                # print(3.4)
                 stop = time.time()
                 print("{:.10f}".format(stop - start), file=accuracy_comp_file) if rank == 0 else None
-                # print(4)
                 
                 # Average gradients among sub-batches
                 # torch.cuda.synchronize()
@@ -168,17 +160,13 @@ def train(epoch, log_dir):
                 stop = time.time()
                 print("{:.10f}".format(stop - start), file=backward_time_file) if rank == 0 else None
                 
-            # print("-------for loop end-----------")
             # Gradient is applied across all ranks
             torch.cuda.synchronize()
             # weight update
             start = time.time()
-            # print("------------main step() start----------------------")
             optimizer.step()
-            # print("------------main step() end----------------------")
             sync_start = time.time()
             torch.cuda.synchronize()
-            # _weight_exchange(model, index)
             mg_we_forward._weight_exchange()
             stop = time.time()
             print("{:.10f}".format(stop - sync_start), file=weightupdate_time_file) if rank == 0 else None
@@ -219,8 +207,6 @@ def train(epoch, log_dir):
         accuracy_file.close()
         loss_file.close()
         accuracy_comp_file.close()
-        #accuracy_iter_file.close()
-        #loss_iter_file.close()
         epoch_time_file.close()
    
 def validate(epoch, log_dir):
@@ -318,12 +304,8 @@ class Metric(object):
         self.n = torch.tensor(0.)
 
     def update(self, val):
-        # print("update 1")
-        # print(val.detach().cpu().size())
         self.sum += hvd.allreduce(val.detach().cpu(), name=self.name)
-        # print("update 2")
         self.n += 1
-        # print("update 3")
 
     @property
     def avg(self):
@@ -365,33 +347,9 @@ class Merge_GE_FORWARD():
 
         self.model = model
         self.group_size = group_size
-        # print("name_params \n")
-        # print(self._named_parameters.keys())
         self._generate_merged_parameters()
-        
 
-
-    def _generate_groups_with_layer(self):
-        # sizes = [self._named_parameters[k].data.numel() for k in self._sequential_keys][::-1] # reverse order
-        # self._sizes = sizes
-
-        groups = []
-        group = []
-        key_groupidx_maps = {}
-        idx = 0
-
-        # considered a layer as a group 
-        for name, layer in self.model.named_children():
-            for k, v in layer.named_parameters():
-                key_groupidx_maps[name+'.'+k] = idx
-                group.append(name+'.'+k)
-            if len(group)!=0:
-                groups.append(group)
-                group = []
-                idx += 1
-
-        return groups, key_groupidx_maps
-
+    # record the group member in each group
     def _generate_groups_with_number(self) :
         num = 0
         groups = []
@@ -410,26 +368,21 @@ class Merge_GE_FORWARD():
                     groups.append(group)
                     group = []
                     num = 0
-            #     key_groupidx_maps[name+'.'+k] = idx
-            #     group.append(name+'.'+k)
-            # if len(group)!=0:
-            #     groups.append(group)
-            #     group = []
-            #     idx += 1
         if len(group) > 0:
             groups.append(group)
         return groups, key_groupidx_maps
 
+    # merge several (self.group_size) parameters into a group 
     def _generate_merged_parameters(self):
         self._merged_parameters = {}
         self._merged_parameter_names = {}
-        # groups, key_groupidx_maps = self._generate_groups_with_layer()
         groups, key_groupidx_maps = self._generate_groups_with_number()
 
         new_keys = []
         self._merged_parameter_offsets = {}
         self._layerwise_compressors = None
         self._layerwise_compressors = {}
+        # create the merge_parameter tensor (t) to store the content of  model parameter
         for g in groups:
             sub_size = 0
             offsets = []
@@ -453,7 +406,7 @@ class Merge_GE_FORWARD():
                 flags.append(0)
             self._groups_flags.append(flags)
 
-    # copy data to merge_parameter
+    # assign the value of model parameter into merge_parameter tensor 
     def _push_to_buffer(self, name, tensor):
         with torch.no_grad():
             if len(self._groups) == len(self._sequential_keys):
@@ -469,9 +422,11 @@ class Merge_GE_FORWARD():
             self._groups_flags[group_idx][layer_idx] = 1
             # record if all para in groups is done or not.
             for idx in self._groups_flags[group_idx]:
+                # if there is someone have not been assigned into merge tensor, the tensor will return None
                 if idx == 0:
                     return name, None
             return new_key, self._merged_parameters[new_key]
+
 
     def _allgather_weight_async(self, params, name):
         index = hvd.rank()
@@ -492,48 +447,19 @@ class Merge_GE_FORWARD():
             handle = allgather_async(tensor[index*s + q : (index+1)*s + q], allgather_name)
         return handle, None
 
+    #  do weight exchange in each merge_parameters
     def _weight_exchange(self):
-        # global handles
 
-        # push data into group tensor, if not all data ready , new_tensor==None
-        # if not data ready do allgather
         for layer, module in self.model.named_children():
             for k, v in module.named_parameters():
-            # name = self._parameter_names.get(p)
+                # if the merge_parameter is ready, the new_tensor is not None and do the following operation
                 new_name, new_tensor = self._push_to_buffer(layer+'.'+k, v.data)
                 if new_tensor is not None:
-                    # print("new_tensor is not None")
                     handle, ctx = self._allgather_weight_async(new_tensor, new_name)
                     self._handles[new_tensor] = (handle, 1)
 
 
-    # # #   k:name, v:parameter
-    #     for k,v in model.named_parameters():
-    #         if v.data is not None:
-    #             # tensor = v.data.view(-1)
-    #             # allreduce_name = name
-    #             # if len(name) > 100:
-    #             #     allreduce_name = name[0:50]+'...'+name[50:100]
-    #             # https://horovod.readthedocs.io/en/stable/_modules/horovod/torch/mpi_ops.html#allreduce_async_
-    #             # allreduce by parameter name 
-    #             # handle = allreduce_async_(tensor, average=True, name=allreduce_name)
-    #             # return handle, None
-
-    #             tensor = v.data.view(-1)
-                
-    #             s = tensor.size().numel()//hvd.size()
-    #             q = tensor.size().numel()%hvd.size()
-
-    #             if index < q:
-    #                 handle = allgather_async(tensor[ index*s + index : (index+1)*s + index + 1])
-    #             elif index == q:
-    #                 handle = allgather_async(tensor[ index*s + index : (index+1)*s + index])
-    #             else:
-    #                 handle = allgather_async(tensor[index*s + q : (index+1)*s + q])
-
-    #             handles[k] = (handle, 1)
-
-    # get data from merge_parameter
+    # get the value of model parameter from merge_parameter tensor
     def _pull_from_buffer(self, name, merged_tensor):
         if len(self._groups) == len(self._sequential_keys):
             shape = self._named_parameters[name].data.shape
@@ -550,77 +476,27 @@ class Merge_GE_FORWARD():
             tensors[k] = merged_tensor.data[offset:offset+numel].view(original_tensor.shape)
         return tensors
 
+    # before the forward path, the _make_hook function will be called first
     def _make_hook(self):
         def hook(*ignore):
-        # global handles
-        # # k : name, v: params
-        # for k, v in module.named_parameters():
-        #     if k in handles:
-        #         handle = handles[k][0]
-        #         output = synchronize(handle)
-
-        #         del handles[k] 
-        #         tensor = v.data.view(-1)
-        #         tensor.data = output.data.clone()
-
             for p, value in self._handles.items():
-                # name = self._merged_parameter_names.get(p)
                 handle, ctx  = value
-                # print("synchronize\n")
                 output = synchronize(handle)
-                # print(output.size())
                 p.set_(output)
-                # if self._profiling:
-                #     utils.force_insert_item(self._update_times, name, time.time()-stime)
             if len(self._groups) != len(self._sequential_keys):
                 for merged_p, v in self._handles.items():
                     new_name = self._merged_parameter_names.get(merged_p)
                     tensors = self._pull_from_buffer(new_name, merged_p)
-                    # print(tensors.keys())
                     for n in tensors:
                         p = self._named_parameters.get(n)
-                        # if settings.FP16:
-                        #     p.grad.set_(tensors[n].data.type(p.grad.type()))
-                        # else:
-                            # p.grad.set_(tensors[n].data)
-                        # with torch.no_grad():
                         p.data.copy_(tensors[n].data)
-                    # torch.cuda.empty_cache()
-            # print("len(self._handles) : {}".format(len(self._handles)))
             self._handles.clear()
-            # print("len(self._handles) : {}".format(len(self._handles)))
         return hook
+    
+    # we pre-hook a specific function on each module. The specific function will be called every time before forward() is invoked.
     def _register_pre_forward_hooks(self):
-        # for i, layer in enumerate(model.modules()):
-        #     # print(num)
-        #     # TODO: check transfomer is ok?
-        #     layer.register_forward_pre_hook(self._make_hook())
         for k, v in self.model.named_modules():
             v.register_forward_pre_hook(self._make_hook())
-
-
-    # def _index(self):
-    #     tensor = torch.linspace(0, hvd.size()*2-2, hvd.size()*2-1).cuda()
-    #     handle = reducescatter_async(tensor)
-    #     output = synchronize(handle)
-    #     index = int(output.detach().cpu().tolist()[0]//2)
-    #     return index
-
-# def dist_wu(optimizer):
-#     hs = hvd.size()
-#     index = hvd.rank()
-#     for group in optimizer.param_groups:
-#         for p in group['params']:
-#             if p.grad is not None:
-#                 s = p.size().numel()//hs
-#                 q = p.size().numel()%hs
-#                 if index < q:
-#                     p = p.view(-1)[index*s+index: (index+1)*s+index+1]
-#                 elif index == q:
-#                     p = p.view(-1)[index*s+index: (index+1)*s+index]
-#                 else:
-#                     p = p.view(-1)[index*s+q: (index+1)*s+q]
-
 
 if __name__ == '__main__':
     args = parser.parse_args()
@@ -755,8 +631,6 @@ if __name__ == '__main__':
         model = torchvision.models.efficientnet_v2_l()
     if args.model=='vgg19':
         model = torchvision.models.vgg19()
-    # if hvd.rank()==0:
-    #     print(summary(model.cuda(), input_size=(3, 224, 224)))
 
 
     # By default, Adasum doesn't need scaling up learning rate.
@@ -772,36 +646,15 @@ if __name__ == '__main__':
 
     # Horovod: scale learning rate by the number of GPUs.
 
-    # index = hvd.rank()
-    # dis_params = []
-    # for param in list(model.parameters()):
-    #     if param.requires_grad:
-    #         p = param.view(-1)
-    #         s = p.size().numel()//hvd.size()
-    #         q = p.size().numel()%hvd.size()
-    #         if index < q:
-    #             dis_params.append(p[ index*s + index : (index+1)*s + index + 1])
-    #         elif index == q:
-    #             dis_params.append(p[ index*s + index : (index+1)*s + index])
-    #         else:
-    #             dis_params.append(p[index*s + q : (index+1)*s + q])
 
-
-    # optimizer = optim.SGD(dis_params,
-    #                       lr=(args.base_lr *
-    #                           lr_scaler),
-    #                       momentum=args.momentum, weight_decay=args.wd)
     optimizer = optim.SGD(model.parameters(),
                           lr=(args.base_lr *
                               lr_scaler),
                           momentum=args.momentum, weight_decay=args.wd)
-    # dist_wu(optimizer)
     # Horovod: (optional) compression algorithm.
     compression = hvd.Compression.fp16 if args.fp16_allreduce else hvd.Compression.none
 
-    # index = _index()
     # Horovod: wrap optimizer with DistributedOptimizer.
-    # print("optimizer = dis_hvd.DistributedOptimizer")
     seq_layernames = []
     for name, p in model.named_parameters():
         seq_layernames.append(name)
@@ -811,11 +664,7 @@ if __name__ == '__main__':
         seq_layernames=seq_layernames,
         group_size = args.group_size,
         op = "reducescatter_allgather",
-        # index = index,
-        # op=hvd.Adasum if args.use_adasum else hvd.Average,
-        # gradient_predivide_factor=args.gradient_predivide_factor
         )
-    # scheduler = LambdaLR(optimizer, lr_lambda=adjust_learning_rate)
     # Restore from a previous checkpoint, if initial_epoch is specified.
     # Horovod: restore on the first worker which will broadcast weights to other workers.
     if resume_from_epoch > 0 and hvd.rank() == 0:
@@ -824,24 +673,11 @@ if __name__ == '__main__':
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
 
-    # print("hvd.broadcast_parameters(model.state_dict(), root_rank=0)")
     # Horovod: broadcast parameters & optimizer state.
     dis_hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-    # print("hvd.broadcast_optimizer_state(optimizer, root_rank=0)")
-    # dis_hvd.broadcast_optimizer_state(optimizer, root_rank=0)
-    # print("_register_pre_forward_hooks(model)")
     mg_we_forward = Merge_GE_FORWARD(model = model, seq_layernames = seq_layernames, named_parameters = model.named_parameters(), group_size = args.group_size)
     mg_we_forward._register_pre_forward_hooks()
-    # print("MPI.COMM_WORLD.Barrier()")
     
-    # why
-    # MPI.COMM_WORLD.Barrier()
     for epoch in range(resume_from_epoch, args.epochs):
-        # print('---------------------train start---------------------------')
         train(epoch,args.log_dir)
-        # print('---------------------train end---------------------------')
         validate(epoch, args.log_dir)
-        # scheduler.step()
-        #save_checkpoint(epoch)
-        # if epoch % 10 == 0:
-           # save_checkpoint(epoch)
